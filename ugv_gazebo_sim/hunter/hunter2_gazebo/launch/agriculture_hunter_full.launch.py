@@ -1,133 +1,136 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, SetEnvironmentVariable
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import Command
+from launch.substitutions import Command, LaunchConfiguration
 from launch_ros.actions import Node
+import launch_ros.descriptions
 
 def generate_launch_description():
-    
     # ---------------------------------------------------------
-    # 1. Paket Yolları
+    # 1. PAKET YOLLARI
     # ---------------------------------------------------------
-    pkg_cpr_agriculture = get_package_share_directory('cpr_agriculture_gazebo')
-    pkg_cpr_accessories = get_package_share_directory('cpr_accessories_gazebo')
+    pkg_hunter = get_package_share_directory('hunter2_base')
+    pkg_agri = get_package_share_directory('cpr_agriculture_gazebo')
     pkg_gazebo_ros = get_package_share_directory('gazebo_ros')
-    pkg_hunter_gazebo = get_package_share_directory('hunter2_gazebo') 
 
     # ---------------------------------------------------------
-    # 2. GAZEBO_MODEL_PATH Ayarı (Mesh ve Texture Yolları)
+    # 2. MODEL PATH AYARLARI (Mesh'lerin görünmesi için kritik)
     # ---------------------------------------------------------
-    agriculture_path = os.path.dirname(pkg_cpr_agriculture)
-    accessories_path = os.path.dirname(pkg_cpr_accessories)
-    hunter_path = os.path.dirname(pkg_hunter_gazebo) 
-
-    existing_model_path = os.environ.get('GAZEBO_MODEL_PATH', '')
+    hunter_models_path = os.path.join(pkg_hunter, 'models')
+    agri_path = os.path.dirname(pkg_agri)
     
-    # Tüm yolları birleştirelim
-    path_set = {agriculture_path, accessories_path, hunter_path}
+    # CPR aksesuarları varsa onları da ekleyelim
+    try:
+        pkg_accessories = get_package_share_directory('cpr_accessories_gazebo')
+        accessories_path = os.path.dirname(pkg_accessories)
+    except:
+        accessories_path = ""
+
+    # Mevcut yolları koruyarak yenilerini ekle
+    existing_model_path = os.environ.get('GAZEBO_MODEL_PATH', '')
+    path_set = {hunter_models_path, agri_path}
+    if accessories_path:
+        path_set.add(accessories_path)
     if existing_model_path:
         for p in existing_model_path.split(':'):
             if p: path_set.add(p)
 
-    new_model_path = ':'.join(list(path_set))
-
     set_model_path_cmd = SetEnvironmentVariable(
         name='GAZEBO_MODEL_PATH', 
-        value=new_model_path
+        value=':'.join(list(path_set))
     )
 
     # ---------------------------------------------------------
-    # 3. Gazebo Başlatma
+    # 3. TANIMLAMALAR (URDF / XACRO)
     # ---------------------------------------------------------
-    world_file_name = 'actually_empty_world.world'
-    world_path = os.path.join(pkg_cpr_agriculture, 'worlds', world_file_name)
+    # Robot Tanımı
+    hunter_xacro_file = os.path.join(pkg_hunter, 'urdf', 'hunter2_base_gazebo.xacro')
+    hunter_description_content = Command(['xacro ', hunter_xacro_file])
 
-    gazebo_simulator = IncludeLaunchDescription(
+    # Tarım Arazisi Tanımı
+    agri_xacro_file = os.path.join(pkg_agri, 'urdf', 'agriculture_geometry.urdf.xacro')
+    agri_description_content = Command(['xacro ', agri_xacro_file])
+
+    # ---------------------------------------------------------
+    # 4. NODE'LAR VE DOSYALAR
+    # ---------------------------------------------------------
+    
+    # Gazebo Başlatma
+    default_world_path = os.path.join(pkg_agri, 'worlds', 'actually_empty_world.world')
+    gazebo_ld = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(pkg_gazebo_ros, 'launch', 'gazebo.launch.py')
         ),
-        launch_arguments={'world': world_path, 'verbose': 'true'}.items()
+        launch_arguments={
+            "use_sim_time": "true",
+            "world": default_world_path,
+            "gui": "true",
+        }.items(),
     )
 
-    # ---------------------------------------------------------
-    # 4. Tarım Arazisini (Environment) Spawn Etme
-    # ---------------------------------------------------------
-    agri_xacro_file = os.path.join(pkg_cpr_agriculture, 'urdf', 'agriculture_geometry.urdf.xacro')
-    agri_description_content = Command(['xacro ', agri_xacro_file])
+    # Tarım Arazisi State Publisher (Remapped)
+    agri_state_pub = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        name='agriculture_state_publisher',
+        parameters=[{'robot_description': agri_description_content}],
+        remappings=[('/robot_description', '/agriculture_description')]
+    )
 
+    # Robot State Publisher
+    hunter_state_pub = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        name='hunter_state_publisher',
+        parameters=[{
+            'robot_description': launch_ros.descriptions.ParameterValue(hunter_description_content, value_type=str),
+            'use_sim_time': True
+        }]
+    )
 
-    spawn_agriculture = Node(
+    # Araziyi Spawn Et
+    spawn_agri = Node(
         package='gazebo_ros',
         executable='spawn_entity.py',
-        arguments=['-topic', '/agriculture_description', '-entity', 'agriculture_geometry', '-x', '0', '-y', '0', '-z', '0'],
+        arguments=[
+            '-topic', '/agriculture_description', 
+            '-entity', 'agriculture_geometry'
+        ],
         output='screen'
     )
 
-    # ---------------------------------------------------------
-    # 5. Hunter Robot Spawn
-    # ---------------------------------------------------------
-    spawn_car = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([
-            os.path.join(pkg_hunter_gazebo, 'launch', 'hunter_spawn.launch.py')
-        ]),
-        launch_arguments={
-            'start_x': '0', 'start_y': '0', 'start_z': '0.3', 
-            'pub_tf': 'true', 'tf_freq': '100.0'
-        }.items()
+    # Robotu Spawn Et
+    spawn_hunter = Node(
+        package='gazebo_ros',
+        executable='spawn_entity.py',
+        arguments=[
+            '-entity', 'hunter2',
+            '-topic', 'robot_description',
+            '-x', '0.0', '-y', '0.0', '-z', '0.5'
+        ],
+        output='screen'
     )
 
-    # ---------------------------------------------------------
-    # 6. RViz2 Başlatma
-    # ---------------------------------------------------------
-    rviz_config_file = os.path.join(pkg_hunter_gazebo, 'rviz', 'default.rviz')
+    # RViz
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',
         name='rviz2',
-        output='screen',
-        arguments=['-d', rviz_config_file],
+        arguments=['-d', os.path.join(pkg_hunter, 'rviz/urdf.rviz')],
+        output='screen'
     )
 
     # ---------------------------------------------------------
-    # 7. Bozuk TF'leri Düzeltme (Static Publishers) [YENİ EKLENDİ]
+    # 5. FIRLATMA
     # ---------------------------------------------------------
-    # Resimdeki hata veren linklerin listesi
-    broken_links = [
-        'front_left_wheel_link',
-        'front_right_wheel_link',
-        'front_steer_left_link',
-        'front_steer_link',
-        'front_steer_right_link',
-        'rear_left_link',
-        'rear_right_link'
-    ]
-    
-    static_tf_nodes = []
-    
-    # Her bir bozuk link için bir static_transform_publisher oluşturuyoruz.
-    # Bunları base_link'e (0,0,0) noktasından bağlıyoruz.
-    # NOT: Bu işlem hataları giderir ama tekerlekler RViz'de dönmez, sabit kalır.
-    for link_name in broken_links:
-        node = Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            name=f'static_tf_{link_name}',
-            arguments=['0', '0', '0', '0', '0', '0', 'base_link', link_name],
-            output='screen'
-        )
-        static_tf_nodes.append(node)
-
-    # Return listesini oluştururken static node'ları da ekliyoruz
-    ld_list = [
+    return LaunchDescription([
         set_model_path_cmd,
-        gazebo_simulator,
-        
-        spawn_agriculture,
-        spawn_car,
+        gazebo_ld,
+        agri_state_pub,
+        hunter_state_pub,
+        spawn_agri,
+        spawn_hunter,
         rviz_node
-    ]
-    
-    # Listeleri birleştir
-    return LaunchDescription(ld_list + static_tf_nodes)
+    ])
